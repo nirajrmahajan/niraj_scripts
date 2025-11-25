@@ -13,3 +13,5 @@
 *.nii
 *.gz
 *.zip
+*.csv
+*.parquet
