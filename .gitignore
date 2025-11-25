@@ -1,0 +1,15 @@
+*.png
+*.jpg
+*.jpeg
+*.safetensor
+*.safetensors
+*.temp
+*.data
+*.dat
+*.bmp
+*.pth
+*.pt
+*.nii.gz
+*.nii
+*.gz
+*.zip
