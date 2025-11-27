@@ -15,3 +15,5 @@
 *.zip
 *.csv
 *.parquet
+*.bkp
+__pycache__/
