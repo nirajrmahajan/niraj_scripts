@@ -1,5 +1,6 @@
 import ast
 import os
+from typing import Dict, Optional
 
 import loguru
 import numpy as np
@@ -188,7 +189,7 @@ def _get_strict_bbox_from_mask3d(mask):
     }
 
 
-def _add_data_split_column(df: pd.DataFrame):
+def _add_data_split_column(df: pd.DataFrame, datasplit_dict: Optional[Dict[str, str]] = None):
     """Add a train/val split while roughly matching abnormality distributions."""
     if len(df) == 0:
         df["split"] = []
@@ -197,6 +198,7 @@ def _add_data_split_column(df: pd.DataFrame):
     missing_cols = [col for col in ALL_ABN_KEYS if col not in df.columns]
     assert not missing_cols, f"Missing abnormality columns: {missing_cols}"
     assert "series_uid" in df.columns, "Missing 'series_uid' column."
+    datasplit_dict = datasplit_dict or {}
 
     def _to_binary(value):
         if pd.isna(value):
@@ -238,6 +240,7 @@ def _add_data_split_column(df: pd.DataFrame):
 
     abn_matrix = abn_df.to_numpy(dtype=float)
     assignments = np.empty(total_samples, dtype=object)
+    assignments[:] = None
     rng = np.random.default_rng(42)
 
     series_uids = df["series_uid"].tolist()
@@ -246,7 +249,7 @@ def _add_data_split_column(df: pd.DataFrame):
         uid_to_indices.setdefault(uid, []).append(idx)
 
     group_entries = []
-    for indices in uid_to_indices.values():
+    for uid, indices in uid_to_indices.items():
         idx_array = np.array(indices, dtype=int)
         group_vec = abn_matrix[idx_array].sum(axis=0)
         group_entries.append(
@@ -254,6 +257,7 @@ def _add_data_split_column(df: pd.DataFrame):
                 "indices": idx_array,
                 "counts": group_vec,
                 "size": len(indices),
+                "series_uid": uid,
             }
         )
 
@@ -265,8 +269,41 @@ def _add_data_split_column(df: pd.DataFrame):
         ratios = new_counts / new_size
         return np.abs(ratios - overall_ratio).sum()
 
+    preset_uids = set()
+    if datasplit_dict:
+        allowed_choices = {"train", "valid_test"}
+        invalid_values = {uid: choice for uid, choice in datasplit_dict.items() if choice not in allowed_choices}
+        assert not invalid_values, f"Invalid split choices supplied: {invalid_values}"
+        missing_uids = [uid for uid in datasplit_dict if uid not in uid_to_indices]
+        if missing_uids:
+            loguru.logger.warning(f"datasplit_dict contains UIDs absent from dataframe: {missing_uids}")
+
+        for group_entry in group_entries:
+            uid = group_entry["series_uid"]
+            choice = datasplit_dict.get(uid)
+            if choice is None:
+                continue
+            assignments[group_entry["indices"]] = choice
+            if choice == "train":
+                train_counts += group_entry["counts"]
+                train_size += group_entry["size"]
+            else:
+                val_counts += group_entry["counts"]
+                val_size += group_entry["size"]
+            preset_uids.add(uid)
+    if uid_to_indices:
+        preset_count = len(preset_uids)
+        total_uid_count = len(uid_to_indices)
+        print(
+            f"datasplit_dict preset splits: {preset_count}, "
+            f"new splits to compute: {max(total_uid_count - preset_count, 0)}"
+        )
+
     for group_pos in group_order:
         group_entry = group_entries[group_pos]
+        if group_entry["series_uid"] in preset_uids:
+            continue
+
         row_vec = group_entry["counts"]
         row_size = group_entry["size"]
         if train_size >= train_target:

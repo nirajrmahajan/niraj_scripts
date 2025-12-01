@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 from concurrent.futures import ProcessPoolExecutor
+from copy import deepcopy
 
 import pandas as pd
 from helpers.csv_utils import (
@@ -238,6 +239,11 @@ if __name__ == "__main__":
     redbricks_csv = "/cache/fast_data_nas8/qct_segmentations/annotations/download/qCT_Lung_Cancer_penrad_6_stage_1_0925/annotations.csv"
     redbricks_df = pd.read_csv(redbricks_csv)
 
+    datasplit_csv = pd.read_csv(
+        "/home/users/niraj.mahajan/projects/scripts/ct_fp_stage1_annot_scripts/penrad_datasplit.csv"
+    )
+    datasplit_dict = dict(zip(datasplit_csv["series_uid"], datasplit_csv["split"]))
+
     all_abn_dicts_per_series_id = _generate_all_abn_dicts_per_series_id(redbricks_df)
 
     backup_master_path = os.path.join("redbricks_fp_master.parquet.bkp")
@@ -255,7 +261,19 @@ if __name__ == "__main__":
     )
     master_df = _drop_scans_with_few_slices(master_df)
 
-    master_df_with_split = _add_data_split_column(master_df.copy())
+    master_df_with_split = _add_data_split_column(master_df.copy(), deepcopy(datasplit_dict))
+
+    # assert old datasplit is preserved for sids in datasplit_dict
+    for key, value in datasplit_dict.items():
+        all_rows_sid = master_df_with_split[master_df_with_split["series_uid"] == key]
+        all_split_values = all_rows_sid["split"].unique()
+        if len(all_split_values) == 0:
+            continue
+        assert len(all_split_values) == 1, f"Expected 1 split value for series_uid {key}, got {all_split_values}"
+        assert (
+            all_split_values[0] == value
+        ), f"Expected split value {value} for series_uid {key}, got {all_split_values[0]}"
+
     validate_final_df(master_df_with_split)
     print("Master dataframe validated")
 
