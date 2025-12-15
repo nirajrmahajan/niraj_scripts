@@ -25,9 +25,13 @@ _BACKUP_LUNG_BBOX_CACHE_PATH = None
 
 
 def _get_abn_key_from_df_meta(row):
+    if "nodule_type" not in _eval_if_str(row["meta"]):
+        return None
     if _eval_if_str(row["meta"])["nodule_type"] == "true positive":
         return "nodule"
     elif _eval_if_str(row["meta"])["nodule_type"] == "false positive":
+        if "reason_for_false_positive" not in _eval_if_str(row["meta"]):
+            return None
         fp_type = FP_REDBRICKS2CSV_MAP[_eval_if_str(row["meta"])["reason_for_false_positive"]]
         assert fp_type in ALL_ABN_KEYS, f"Invalid false positive type: {fp_type}. Must be one of {ALL_ABN_KEYS}"
         return fp_type
@@ -43,6 +47,8 @@ def _generate_all_abn_dicts_per_series_id(df):
         ans[sid] = {}
         for _, row in sid_df.iterrows():
             fp_type = _get_abn_key_from_df_meta(row)
+            if fp_type is None:
+                continue
             ans[sid][fp_type] = ans[sid].get(fp_type, []) + [(row["annot_id"], _eval_if_str(row["annot"])["bbox"])]
             if fp_type != "nodule":
                 ans[sid]["non_nodule_fp"] = ans[sid].get("non_nodule_fp", []) + [
@@ -150,6 +156,8 @@ def _build_master_row_entry(row, all_abn_dicts_per_series_id, lung_bbox_cache):
         "other_fp": 0,
         "non_nodule_fp": 0,
     }
+    if fp_type not in fp_dict:
+        return None
     assert fp_type in fp_dict, f"Invalid false positive type: {fp_type}. Must be one of {fp_dict.keys()}"
     fp_dict[fp_type] = 1
     if fp_type != "nodule":
@@ -236,8 +244,18 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    redbricks_csv = "/cache/fast_data_nas8/qct_segmentations/annotations/download/qCT_Lung_Cancer_penrad_6_stage_1_0925/annotations.csv"
+    redbricks_csv_old = "/cache/fast_data_nas8/qct_segmentations/annotations/download/qCT_Lung_Cancer_penrad_6_stage_1_0925/annotations.csv"
+    redbricks_csv = "/cache/fast_data_nas8/qct_segmentations/annotations/download/qCT_Lung_Cancer_penrad_7_stage_1_1125/annotations.csv"
+    redbricks_df_old = pd.read_csv(redbricks_csv_old)
     redbricks_df = pd.read_csv(redbricks_csv)
+
+    missing_annot_ids = set(redbricks_df_old["annot_id"]) - set(redbricks_df["annot_id"])
+    if missing_annot_ids:
+        missing_rows = redbricks_df_old[redbricks_df_old["annot_id"].isin(missing_annot_ids)].copy()
+        redbricks_df = pd.concat([redbricks_df, missing_rows], ignore_index=True)
+        print(f"Copied {len(missing_rows)} annotations absent in new CSV from backup.")
+    else:
+        print("No missing annotations detected between old and new CSV files.")
 
     datasplit_csv = pd.read_csv(
         "/home/users/niraj.mahajan/projects/scripts/ct_fp_stage1_annot_scripts/penrad_datasplit.csv"

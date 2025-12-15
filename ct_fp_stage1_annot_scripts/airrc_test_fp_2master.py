@@ -27,6 +27,7 @@ def _build_lung_bbox(row):
         CACHE_ROOT, "annotations/lung_masks", mongo_collection_name, f"{row['series_uid']}.nii.gz"
     )
     if not os.path.exists(lung_mask_path):
+        print(f"Lung mask not found for {row['series_uid']}")
         return None
     return _get_lung_bbox(lung_mask_path)
 
@@ -55,25 +56,29 @@ def _cache_lung_bboxes(df, num_workers=1):
     return {row["series_uid"]: bbox for row, bbox in zip(row_dicts, lung_bboxes)}
 
 
-def _load_lung_bbox_cache_from_backup(backup_path, unique_rows):
-    if not os.path.exists(backup_path):
+def _load_lung_bbox_cache_from_backup(backup_path1, backup_path2, unique_rows):
+    if not os.path.exists(backup_path1) and not os.path.exists(backup_path2):
         return None
 
     global _BACKUP_LUNG_BBOX_CACHE
     global _BACKUP_LUNG_BBOX_CACHE_PATH
 
-    if _BACKUP_LUNG_BBOX_CACHE_PATH == backup_path and _BACKUP_LUNG_BBOX_CACHE is not None:
+    if _BACKUP_LUNG_BBOX_CACHE_PATH == backup_path1 and _BACKUP_LUNG_BBOX_CACHE is not None:
         cache = _BACKUP_LUNG_BBOX_CACHE
     else:
         try:
-            backup_df = pd.read_parquet(backup_path, columns=["series_uid", "lung_bbox"])
+            backup_df1 = pd.read_parquet(backup_path1, columns=["series_uid", "lung_bbox"])
+            backup_df2 = pd.read_parquet(backup_path2, columns=["series_uid", "lung_bbox"])
+            backup_df = pd.concat([backup_df1, backup_df2], ignore_index=True)
         except Exception as exc:
-            print(f"Failed to load backup parquet {backup_path}: {exc}")
+            print(f"Failed to load backup parquet {backup_path1} or {backup_path2}: {exc}")
             return None
 
         required_cols = {"series_uid", "lung_bbox"}
         if not required_cols.issubset(set(backup_df.columns)):
-            print(f"Backup parquet {backup_path} missing required columns {required_cols}; recomputing lung bboxes.")
+            print(
+                f"Backup parquet {backup_path1} and {backup_path2} missing required columns {required_cols}; recomputing lung bboxes."
+            )
             return None
 
         def _deserialize_bbox(value):
@@ -95,26 +100,28 @@ def _load_lung_bbox_cache_from_backup(backup_path, unique_rows):
                 cache[sid] = parsed_bbox
 
         if not cache:
-            print(f"Backup parquet {backup_path} did not yield any lung bboxes; recomputing from masks.")
+            print(
+                f"Backup parquet {backup_path1} and {backup_path2} did not yield any lung bboxes; recomputing from masks."
+            )
             return None
 
         _BACKUP_LUNG_BBOX_CACHE = cache
-        _BACKUP_LUNG_BBOX_CACHE_PATH = backup_path
+        _BACKUP_LUNG_BBOX_CACHE_PATH = backup_path1
 
-    required_keys = set(map(tuple, unique_rows.to_numpy()))
+    required_keys = set(unique_rows["series_uid"])
     missing = list(required_keys - set(cache.keys()))
-    print(f"Loaded lung bboxes for {len(cache)} series from backup {backup_path}.")
+    print(f"Loaded lung bboxes for {len(cache)} series from backup {backup_path1} and {backup_path2}.")
     if missing:
         print(f"Backup missing lung bboxes for {len(missing)} series; will compute those from masks.")
     return cache.copy(), missing
 
 
-def _generate_all_abn_dicts_per_series_id(test_fp_df):
+def _generate_all_abn_dicts_per_series_id(test_fp_df, aid2reason_fp):
     all_preds_dict = {}
     for i in tqdm(range(len(test_fp_df)), "Generating Abnormality Dictionaries"):
         row = test_fp_df.iloc[i]
         series_uid = row["series_uid"]
-        annot_id = series_uid + "__" + str(row["annot_uid"])
+        annot_id = row["annot_uid"]
         fp_category = {"2d": "nodule", "2c": "non_nodule_fp", "FN": "fn_nodule"}[row["category"]]
         if fp_category == "fn_nodule":
             continue
@@ -132,10 +139,16 @@ def _generate_all_abn_dicts_per_series_id(test_fp_df):
         if fp_category not in all_preds_dict[series_uid]:
             all_preds_dict[series_uid][fp_category] = []
         all_preds_dict[series_uid][fp_category].append((annot_id, fp_bbox))
+        if fp_category == "non_nodule_fp":
+            reason_fp = aid2reason_fp.get(annot_id)
+            if reason_fp == "pulmonary_vessel":
+                all_preds_dict[series_uid]["pulmonary_vessel"] = all_preds_dict[series_uid].get(
+                    "pulmonary_vessel", []
+                ) + [(annot_id, fp_bbox)]
     return all_preds_dict
 
 
-def _generate_master_df(test_fp_df, lung_bbox_map, sid2spacing):
+def _generate_master_df(test_fp_df, lung_bbox_map, sid2spacing, aid2reason_fp):
     # Simple for loop
     master_data = []
     for sid in tqdm(all_abn_dicts_per_series_id.keys(), desc="Generating Master DF"):
@@ -143,6 +156,7 @@ def _generate_master_df(test_fp_df, lung_bbox_map, sid2spacing):
         test_fp_row = test_fp_df.loc[sid]
         if isinstance(test_fp_row, pd.DataFrame):
             test_fp_row = test_fp_row.iloc[0]
+        data_split = test_fp_row["data_split"]
 
         lung_bbox = lung_bbox_map.get(sid)
         safetensor_path = test_fp_row["scan_filepath"]
@@ -153,34 +167,41 @@ def _generate_master_df(test_fp_df, lung_bbox_map, sid2spacing):
         for abn_key in all_abn_dict.keys():
             for annot_id, bbox in all_abn_dict[abn_key]:
                 if abn_key == "non_nodule_fp":
-                    dicc = {
-                        "series_uid": sid,
-                        "annot_id": annot_id,
-                        "safetensor_path": safetensor_path,
-                        "abn_bbox": bbox,
-                        "lung_bbox": lung_bbox,
-                        "all_abn_bboxes_in_sid": all_abn_dict,
-                        "spacing": spacing,
-                        "split": "test",
-                        "dataset_name": "qct_cache_test_fps",
-                        "nodule": 0,
-                        "fibrosis": -100,
-                        "apical_pleural_thickening": -100,
-                        "costochondral_junction_calcification": -100,
-                        "osteophyte": -100,
-                        "pulmonary_vessel": -100,
-                        "ggo": -100,
-                        "consolidation": -100,
-                        "pleural_pathology": -100,
-                        "fissure": -100,
-                        "pleural_effusion": -100,
-                        "intrapulmonary_lymph_node": -100,
-                        "atelectasis": -100,
-                        "reticulation": -100,
-                        "other_fp": -100,
-                        "non_nodule_fp": 1,
-                    }
+                    # check if vessel - if yes, skip - will be added by pulmonary vessel
+                    reason_fp = aid2reason_fp.get(annot_id)
+                    if reason_fp == "pulmonary_vessel":
+                        continue
+                    else:
+                        # add as non nodule fp
+                        dicc = {
+                            "series_uid": sid,
+                            "annot_id": annot_id,
+                            "safetensor_path": safetensor_path,
+                            "abn_bbox": bbox,
+                            "lung_bbox": lung_bbox,
+                            "all_abn_bboxes_in_sid": all_abn_dict,
+                            "spacing": spacing,
+                            "split": data_split,
+                            "dataset_name": "airrc_lidc_fps",
+                            "nodule": 0,
+                            "fibrosis": -100,
+                            "apical_pleural_thickening": -100,
+                            "costochondral_junction_calcification": -100,
+                            "osteophyte": -100,
+                            "pulmonary_vessel": -100,
+                            "ggo": -100,
+                            "consolidation": -100,
+                            "pleural_pathology": -100,
+                            "fissure": -100,
+                            "pleural_effusion": -100,
+                            "intrapulmonary_lymph_node": -100,
+                            "atelectasis": -100,
+                            "reticulation": -100,
+                            "other_fp": -100,
+                            "non_nodule_fp": 1,
+                        }
                 elif abn_key == "nodule":
+                    # add as nodule
                     dicc = {
                         "series_uid": sid,
                         "annot_id": annot_id,
@@ -189,8 +210,8 @@ def _generate_master_df(test_fp_df, lung_bbox_map, sid2spacing):
                         "lung_bbox": lung_bbox,
                         "all_abn_bboxes_in_sid": all_abn_dict,
                         "spacing": spacing,
-                        "split": "test",
-                        "dataset_name": "qct_cache_test_fps",
+                        "split": data_split,
+                        "dataset_name": "airrc_lidc_fps",
                         "nodule": 1,
                         "fibrosis": 0,
                         "apical_pleural_thickening": 0,
@@ -208,8 +229,38 @@ def _generate_master_df(test_fp_df, lung_bbox_map, sid2spacing):
                         "other_fp": 0,
                         "non_nodule_fp": 0,
                     }
+                elif abn_key == "pulmonary_vessel":
+                    # add as vessel
+                    dicc = {
+                        "series_uid": sid,
+                        "annot_id": annot_id,
+                        "safetensor_path": safetensor_path,
+                        "abn_bbox": bbox,
+                        "lung_bbox": lung_bbox,
+                        "all_abn_bboxes_in_sid": all_abn_dict,
+                        "spacing": spacing,
+                        "split": data_split,
+                        "dataset_name": "airrc_lidc_fps",
+                        "nodule": 0,
+                        "fibrosis": 0,
+                        "apical_pleural_thickening": 0,
+                        "costochondral_junction_calcification": 0,
+                        "osteophyte": 0,
+                        "pulmonary_vessel": 1,
+                        "ggo": 0,
+                        "consolidation": 0,
+                        "pleural_pathology": 0,
+                        "fissure": 0,
+                        "pleural_effusion": 0,
+                        "intrapulmonary_lymph_node": 0,
+                        "atelectasis": 0,
+                        "reticulation": 0,
+                        "other_fp": 0,
+                        "non_nodule_fp": 1,
+                    }
                 else:
-                    raise NotImplementedError("Not implemented")
+                    raise ValueError(f"Invalid abn key: {abn_key}")
+
                 master_data.append(dicc)
 
     return pd.DataFrame(master_data)
@@ -248,15 +299,19 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    test_fp_df = pd.read_csv("/raid18/nirman_internal/detection_fpr/lidc_csv/test.csv")
+    test_fp_df = pd.read_csv(
+        "/raid18/nirman_internal/detection_fpr/lidc_csv/lidc_allSplits_AirRC254_with_vessel_fps.csv"
+    )
     test_fp_df.set_index("series_uid", inplace=True, drop=False)
     test_fp_df["scan_filepath"] = test_fp_df["scan_filepath"].replace(
         "qct_cache_august_2025", "qct_data_releases/qct_cache_october_2025", regex=True
     )
+    aid2reason_fp = dict(zip(test_fp_df["annot_uid"], test_fp_df["reason_for_false_positive"]))
 
     unique_lung_rows = test_fp_df[["series_uid"]].drop_duplicates()
-    backup_master_path = os.path.join("qct_cache_test_fp_master.parquet.bkp")
-    backup_result = _load_lung_bbox_cache_from_backup(backup_master_path, unique_lung_rows)
+    backup_master_path1 = os.path.join("qct_cache_test_fp_master.parquet.bkp")
+    backup_master_path2 = os.path.join("qct_cache_master.parquet.bkp")
+    backup_result = _load_lung_bbox_cache_from_backup(backup_master_path1, backup_master_path2, unique_lung_rows)
 
     cache_master_df = pd.read_csv(os.path.join(CACHE_ROOT, "master_csv.csv"))
     sid2spacingx = dict(zip(cache_master_df["series_uid"], cache_master_df["spacing_x"]))
@@ -286,9 +341,9 @@ if __name__ == "__main__":
                 lung_bbox_map.update(regenerated)
 
     print("Generating all abn dicts per series id")
-    all_abn_dicts_per_series_id = _generate_all_abn_dicts_per_series_id(test_fp_df)
+    all_abn_dicts_per_series_id = _generate_all_abn_dicts_per_series_id(test_fp_df, aid2reason_fp)
 
-    master_df = _generate_master_df(test_fp_df, lung_bbox_map, sid2spacing)
+    master_df = _generate_master_df(test_fp_df, lung_bbox_map, sid2spacing, aid2reason_fp)
     master_df = _drop_scans_with_few_slices(master_df)
 
     nested_cols = ["abn_bbox", "lung_bbox", "all_abn_bboxes_in_sid", "spacing"]
@@ -300,7 +355,7 @@ if __name__ == "__main__":
                 lambda x: json.dumps(x, default=str) if isinstance(x, (dict, list, tuple)) else x
             )
 
-    master_df_path = os.path.join("qct_cache_test_fp_master.parquet")
+    master_df_path = os.path.join("airrc_fp_master.parquet")
 
     master_df_to_save.to_parquet(master_df_path, index=False, engine="pyarrow")
     print(f"Master dataframe saved to {master_df_path}")
